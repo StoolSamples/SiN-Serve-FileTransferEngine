@@ -1,0 +1,107 @@
+{
+  "transfer": {
+    "chunk_size": 61440,
+    "base_port": 9000,
+    "_port_layout": "9000=control  9001=feedback(sender binds)  9002-9005=data streams",
+    "num_streams": 4,
+    "socket_buffer_mb": 64,
+    "ack_timeout": 5.0,
+    "max_retries": 20,
+    "window_size": 256,
+    "resend_check_interval": 3.0,
+    "recv_timeout": 600.0,
+    "inter_packet_delay": 0.0,
+    "send_delay_us": 500
+  },
+  "pacing": {
+    "_note": "Step-climb pacing. COARSE→FINE→MICRO→HOLD state machine. See pacing.py.",
+    "initial_rate_mbps": 50,
+    "loss_threshold": 12,
+    "coarse_step_mbps": 10.0,
+    "coarse_interval_s": 2.5,
+    "fine_step_mbps": 1.0,
+    "fine_interval_s": 2.5,
+    "micro_step_mbps": 0.1,
+    "micro_interval_s": 1.0,
+    "hold_interval_s": 2.5,
+    "min_rate_mbps": 10,
+    "_note_rate_hint": "Sender upper speed cap MB/s. 0 = no configured limit.",
+    "rate_hint_mbps": 0.0,
+    "throughput_report_interval_ms": 500
+  },
+  "crypto": {
+    "enabled": false,
+    "algorithm": "AES-256-GCM"
+  },
+  "rate_limiter": {
+    "enabled": false,
+    "send_limit_mbps": 0,
+    "recv_limit_mbps": 0
+  },
+  "logging": {
+    "level": "INFO",
+    "log_to_file": false,
+    "log_file": "fasttransfer.log"
+  },
+  "phase3": {
+    "resume_enabled": false,
+    "progress_interval_ms": 250,
+    "sidecar_flush_interval": 64,
+    "sack_enabled": false,
+    "session_blackout_s": 10.0,
+    "metrics_enabled": false,
+    "metrics_file": ".ft_metrics.json"
+  },
+  "ram": {
+    "_note": "If file fits in available RAM minus reserved, receiver buffers entire file in memory and writes once at end. Eliminates write queue, FINISH overcount, and reduces vCPU pressure.",
+    "allow_ram_loading": true,
+    "_note_reserved": "GB of RAM to keep free for OS and other processes. Supports 2 decimal places.",
+    "ram_amount_reserved_gb": 8.00
+  },
+  "peer_db": {
+    "_note": "Adaptive per-peer pacing memory. Tier is selected by send_count for the remote peer.",
+    "db_path": "peer_db.sqlite",
+
+    "_note_tier0": "Tier 0: first-time peers (send_count == 0). Cold start, no loss step-down.",
+    "unknown_ramp_start_mbps": 50.0,
+    "tier0_ramp_step_mbps": 1.0,
+    "tier0_ramp_interval_sec": 5.0,
+    "tier0_ramp_step_down_mbps": 0.0,
+    "tier0_loss_threshold": 8,
+
+    "_note_tier1": "Tier 1: send_count 1-9. Start at avg_stable_mbps, gentle step-down on loss.",
+    "tier1_ramp_step_mbps": 0.5,
+    "tier1_ramp_interval_sec": 7.5,
+    "tier1_ramp_step_down_mbps": 0.5,
+    "tier1_loss_threshold": 6,
+
+    "_note_tier2": "Tier 2: send_count 10-19. Conservative micro-probing.",
+    "tier2_ramp_step_mbps": 0.1,
+    "tier2_ramp_interval_sec": 10.0,
+    "tier2_ramp_step_down_mbps": 0.3,
+    "tier2_loss_threshold": 6,
+
+    "_note_tier3": "Tier 3: send_count >= 20. Very fine probing for well-characterised links.",
+    "tier3_ramp_step_mbps": 0.05,
+    "tier3_ramp_interval_sec": 10.0,
+    "tier3_ramp_step_down_mbps": 0.1,
+    "tier3_loss_threshold": 4,
+
+    "_note_floor": "Tiers 1-3 only: loss callback will never drop below start_mbps * loss_floor_ratio.",
+    "loss_floor_ratio": 0.5,
+
+    "ramp_ceiling_mbps": 4500.0
+  },
+  "integrity": {
+    "_note_chunk": "Per-chunk xxHash XXH3-64 verification is ALWAYS ON and cannot be disabled by either side.",
+
+    "_note_hash_disabled": "SENDER SETTING. true = sender will NEVER compute whole-file SHA-256, regardless of receiver request. hash_disabled overrides everything. Use when SHA overhead is unacceptable.",
+    "hash_disabled": false,
+
+    "_note_hash_required": "SENDER SETTING. true = sender ALWAYS computes SHA-256 AND the receiver MUST verify it — receiver cannot opt out. false = sender only computes SHA-256 if receiver requests it.",
+    "hash_required": false,
+
+    "_note_hash_requested": "RECEIVER SETTING. true = receiver asks sender to compute SHA-256. This is a REQUEST, not a demand — sender honours it only when hash_disabled is false. false = receiver does not request SHA-256.",
+    "hash_requested": false
+  }
+}
