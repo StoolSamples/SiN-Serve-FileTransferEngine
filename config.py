@@ -138,6 +138,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # ── Absolute ceiling applied to all ramp profiles ──────────────────────
         "ramp_ceiling_mbps":          4500.0,
     },
+    "phase4": {
+        # Sliding window gate (fixed-size; RTT-adaptive is a future placeholder)
+        "window_enabled":       True,
+        "window_size":          256,
+        "window_rtt_adaptive":  False,
+
+        # SACK: receiver sends selective-ack ranges every sack_interval_ms
+        "sack_enabled":         True,
+        "sack_interval_ms":     200,
+
+        # RTT probe: sender sends PING every rtt_probe_interval_s
+        "rtt_probe_interval_s": 10.0,
+        "rtt_ewma_alpha":       0.125,
+    },
     "integrity": {
         # Per-chunk verification (xxHash XXH3-64) is ALWAYS ON.
         # Cannot be disabled from either side.
@@ -456,6 +470,37 @@ class Config:
     def hash_requested(self) -> bool:
         """Receiver: ask sender to compute SHA-256. Advisory — sender may decline."""
         return bool(self.get("integrity", "hash_requested", default=False))
+
+    # ── Phase 4 ───────────────────────────────────────────────────────────────
+
+    @property
+    def window_enabled(self) -> bool:
+        return bool(self.get("phase4", "window_enabled", default=True))
+
+    @property
+    def window_size(self) -> int:
+        return max(1, int(self.get("phase4", "window_size", default=256)))
+
+    @property
+    def window_rtt_adaptive(self) -> bool:
+        return bool(self.get("phase4", "window_rtt_adaptive", default=False))
+
+    @property
+    def sack_enabled(self) -> bool:
+        return bool(self.get("phase4", "sack_enabled", default=True))
+
+    @property
+    def sack_interval_ms(self) -> int:
+        return max(50, int(self.get("phase4", "sack_interval_ms", default=200)))
+
+    @property
+    def rtt_probe_interval_s(self) -> float:
+        return max(1.0, float(self.get("phase4", "rtt_probe_interval_s", default=10.0)))
+
+    @property
+    def rtt_ewma_alpha(self) -> float:
+        raw = float(self.get("phase4", "rtt_ewma_alpha", default=0.125))
+        return max(0.001, min(1.0, raw))
 
     # ── Backward-compat shims for old key names ───────────────────────────────
 

@@ -32,6 +32,9 @@ class PacketType(IntEnum):
     THROUGHPUT_REPORT = 0x0A   # Phase 4: delivery rate report, receiver→sender on 9001 every 500ms
     RATE_HINT         = 0x0B   # Phase 4: max rate advisory, exchanged at handshake start
     LOSS_REPORT       = 0x0C   # sender→receiver on control channel: per-pass ramp diagnostics
+    SACK              = 0x0D   # Phase 4: selective ack ranges, receiver→sender on 9001
+    PING              = 0x0E   # Phase 4: RTT probe request, sender→receiver on 9000
+    PONG              = 0x0F   # Phase 4: RTT probe reply, receiver→sender on 9001
 
 
 _HDR_FMT  = "!B16sII"
@@ -61,6 +64,16 @@ _RATE_HINT_SIZE          = struct.calcsize(_RATE_HINT_FMT)
 
 _LOSS_REPORT_FMT         = "!HIIfBf"  # pass_index(2)+chunks_sent(4)+chunks_lost(4)+current_mbps(4)+tier(1)+pass_duration_sec(4) = 19 bytes
 _LOSS_REPORT_SIZE        = struct.calcsize(_LOSS_REPORT_FMT)
+
+# Phase 4: SACK — run-length encoded received ranges
+_SACK_HEADER_FMT         = "!H"       # count uint16
+_SACK_HEADER_SIZE        = struct.calcsize(_SACK_HEADER_FMT)
+_SACK_RANGE_FMT          = "!II"      # start_chunk_id(4) + run_length(4)
+_SACK_RANGE_SIZE         = struct.calcsize(_SACK_RANGE_FMT)
+
+# Phase 4: PING/PONG — RTT probe
+_PING_FMT                = "!Q"       # send_timestamp_ns uint64
+_PING_SIZE               = struct.calcsize(_PING_FMT)
 
 MAX_CHUNK_SIZE = 65_434
 
@@ -328,3 +341,68 @@ def parse_loss_report_payload(payload: bytes) -> dict:
         "tier":              tier,
         "pass_duration_sec": float(pass_duration_sec),
     }
+
+
+# ─── SACK ──────────────────────────────────────────────────────────────────────
+
+from typing import Tuple  # noqa: E402 (already imported at top via List)
+
+
+def build_sack_payload(ranges: List[Tuple[int, int]]) -> bytes:
+    """
+    Build a SACK payload from a list of (start_chunk_id, run_length) pairs.
+
+    Layout:
+      [0:2]  count       uint16  — number of ranges
+      [2:]   N × [start(uint32) + run_len(uint32)]
+
+    Example: chunks 0–99 and 150–199 received
+      → build_sack_payload([(0, 100), (150, 50)])
+    """
+    buf = struct.pack(_SACK_HEADER_FMT, len(ranges))
+    for start, run_len in ranges:
+        buf += struct.pack(_SACK_RANGE_FMT, start, run_len)
+    return buf
+
+
+def parse_sack_payload(payload: bytes) -> List[Tuple[int, int]]:
+    """
+    Parse a SACK payload into a list of (start_chunk_id, run_length) pairs.
+
+    Raises ValueError on malformed input.
+    """
+    if len(payload) < _SACK_HEADER_SIZE:
+        raise ValueError("SACK payload too short for header")
+    (count,) = struct.unpack_from(_SACK_HEADER_FMT, payload)
+    expected = _SACK_HEADER_SIZE + count * _SACK_RANGE_SIZE
+    if len(payload) < expected:
+        raise ValueError(
+            f"SACK payload truncated: need {expected} bytes, got {len(payload)}"
+        )
+    ranges: List[Tuple[int, int]] = []
+    offset = _SACK_HEADER_SIZE
+    for _ in range(count):
+        start, run_len = struct.unpack_from(_SACK_RANGE_FMT, payload, offset)
+        ranges.append((start, run_len))
+        offset += _SACK_RANGE_SIZE
+    return ranges
+
+
+# ─── PING / PONG ───────────────────────────────────────────────────────────────
+
+def build_ping_payload(timestamp_ns: int) -> bytes:
+    """
+    Build a PING payload carrying a monotonic nanosecond timestamp.
+
+    The receiver echoes this payload EXACTLY in the PONG reply so the
+    sender can compute RTT = now_ns − timestamp_ns.
+    """
+    return struct.pack(_PING_FMT, timestamp_ns)
+
+
+def parse_ping_payload(payload: bytes) -> int:
+    """Parse a PING or PONG payload and return the timestamp_ns."""
+    if len(payload) < _PING_SIZE:
+        raise ValueError("PING/PONG payload too short")
+    (timestamp_ns,) = struct.unpack_from(_PING_FMT, payload)
+    return timestamp_ns

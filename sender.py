@@ -53,9 +53,12 @@ from protocol import (
     PacketType, build_packet, parse_packet,
     build_init_payload, build_meta_payload, build_data_payload,
     build_finish_payload, build_rate_hint_payload, build_loss_report_payload,
+    build_ping_payload, build_sack_payload,
     parse_ack_payload, parse_complete_payload, parse_resend_payload,
     parse_nack_payload, parse_throughput_report_payload, parse_rate_hint_payload,
+    parse_sack_payload, parse_ping_payload,
 )
+from window import RTTEstimator, WindowController
 from ramp_profile import RampProfile
 from rate_limiter import RateLimiter
 from stream_manager import StreamManager
@@ -417,6 +420,22 @@ class FileSender:
         if self._cfg.rate_hint_mbps > 0:
             pacing.set_rate_hint_cap(self._cfg.rate_hint_mbps)
 
+        # ── Phase 4: WindowController ─────────────────────────────────────────
+        rtt_estimator = RTTEstimator(alpha=cfg.rtt_ewma_alpha)
+        if cfg.window_enabled:
+            window_ctrl = WindowController(
+                window_size=cfg.window_size,
+                rtt_estimator=rtt_estimator,
+            )
+            window_ctrl.set_rtt_adaptive(cfg.window_rtt_adaptive)
+            logger.info(
+                "WindowController: enabled  size=%d  rtt_adaptive=%s",
+                cfg.window_size, cfg.window_rtt_adaptive,
+            )
+        else:
+            window_ctrl = None
+            logger.info("WindowController: disabled")
+
         # ── StreamManager (owns stream workers and work queue) ────────────────
         mgr = StreamManager(
             config=self._cfg,
@@ -428,6 +447,7 @@ class FileSender:
             session_id=session_id,
             crypto=self._crypto,
             rate_limiter=self._rate_limiter,
+            window=window_ctrl,
         )
         if self._scaling_hook is not None:
             mgr.set_scaling_hook(self._scaling_hook, self._scaling_hook_interval_s)
@@ -438,7 +458,21 @@ class FileSender:
             nack_lock: threading.Lock = threading.Lock()
 
             # Phase 4: RESEND packets from feedback channel
-            resend_feedback_queue: queue.Queue = queue.Queue()
+            # Replaced per-batch seen-set with a session-scoped pending set
+            # so duplicates across multiple RESEND storms are deduplicated once.
+            pending_resend_set: Set[int] = set()
+            resend_lock: threading.Lock  = threading.Lock()
+
+            # Phase 4: SACK / window tracking
+            # acked_chunks tracks every chunk ACKed via SACK so we can compute
+            # the delta (newly_acked) on each SACK packet without comparing
+            # consecutive SACK snapshots.
+            acked_chunks: Set[int]  = set()
+            acked_lock:   threading.Lock = threading.Lock()
+
+            # Phase 4: RTT probe state — timestamp_ns → sent_monotonic_s
+            pending_pings: dict = {}
+            ping_lock: threading.Lock = threading.Lock()
 
             transfer_t0      = time.monotonic()
             stop_reporter    = threading.Event()
@@ -451,17 +485,41 @@ class FileSender:
 
             # ── Feedback listener thread ──────────────────────────────────────────
 
+            # ── PING sender — fires periodically inside feedback_listener ─────
+            _ping_interval_s  = cfg.rtt_probe_interval_s
+            _last_ping_sent   = [0.0]   # monotonic time of last PING
+
             def feedback_listener() -> None:
                 """
                 Runs on 9001 throughout the transfer.
 
-                THROUGHPUT_REPORT → pacing.update_stable()  [drives stable_mbps]
-                NACK              → nack_set.add()           [NACK pass after initial]
+                THROUGHPUT_REPORT → pacing.update_stable()        [display only]
+                NACK              → nack_set.add()                 [NACK pass]
                 RATE_HINT         → pacing.set_rate_hint_cap()
-                RESEND            → resend_feedback_queue    [FINISH loop]
+                RESEND            → pending_resend_set             [FINISH loop]
+                SACK              → acked_chunks + window.release  [Phase 4]
+                PONG              → window_ctrl.update_rtt()       [Phase 4]
                 """
                 while not stop_feedback.is_set():
                     result = feedback.recv(timeout=0.5)
+
+                    # ── Periodic PING (RTT probe) ──────────────────────────────
+                    now = time.monotonic()
+                    if now - _last_ping_sent[0] >= _ping_interval_s:
+                        _last_ping_sent[0] = now
+                        ts_ns = time.monotonic_ns()
+                        ping_pkt = build_packet(
+                            PacketType.PING, session_id, 0,
+                            build_ping_payload(ts_ns),
+                        )
+                        try:
+                            ctrl.send(ping_pkt, (dest_host, dest_port))
+                            with ping_lock:
+                                pending_pings[ts_ns] = now
+                            logger.debug("PING sent  ts_ns=%d", ts_ns)
+                        except OSError as exc:
+                            logger.debug("PING send error: %s", exc)
+
                     if result is None:
                         continue
                     data, addr = result
@@ -506,9 +564,58 @@ class FileSender:
                         try:
                             chunk_ids = parse_resend_payload(pkt.payload)
                             if chunk_ids:
-                                resend_feedback_queue.put(chunk_ids)
+                                with resend_lock:
+                                    pending_resend_set.update(chunk_ids)
                         except Exception as exc:
                             logger.debug("RESEND parse error: %s", exc)
+
+                    elif pkt.ptype == PacketType.SACK:
+                        # ── Selective ACK handling ─────────────────────────────
+                        # Compute newly-acknowledged chunks relative to the
+                        # session-scoped acked_chunks set (never compare SACK
+                        # snapshots against each other).
+                        try:
+                            ranges = parse_sack_payload(pkt.payload)
+                            with acked_lock:
+                                newly_acked_count = 0
+                                for start, run_len in ranges:
+                                    for cid in range(start, start + run_len):
+                                        if cid not in acked_chunks:
+                                            acked_chunks.add(cid)
+                                            newly_acked_count += 1
+                            if window_ctrl is not None and newly_acked_count > 0:
+                                window_ctrl.release(newly_acked_count)
+                                logger.debug(
+                                    "SACK: +%d newly acked  total_acked=%d  "
+                                    "in_flight=%d",
+                                    newly_acked_count, len(acked_chunks),
+                                    window_ctrl.in_flight,
+                                )
+                        except Exception as exc:
+                            logger.debug("SACK parse error: %s", exc)
+
+                    elif pkt.ptype == PacketType.PONG:
+                        # ── RTT measurement ────────────────────────────────────
+                        try:
+                            ts_ns = parse_ping_payload(pkt.payload)
+                            with ping_lock:
+                                sent_t = pending_pings.pop(ts_ns, None)
+                            if sent_t is not None:
+                                rtt_s = time.monotonic() - sent_t
+                                if window_ctrl is not None:
+                                    window_ctrl.update_rtt(rtt_s)
+                                logger.info(
+                                    "PONG: RTT=%.1f ms  srtt=%s",
+                                    rtt_s * 1_000,
+                                    (f"{rtt_estimator.srtt * 1_000:.1f} ms"
+                                     if rtt_estimator.srtt else "—"),
+                                )
+                            else:
+                                logger.debug(
+                                    "PONG: unknown/stale ts_ns=%d — ignored", ts_ns
+                                )
+                        except Exception as exc:
+                            logger.debug("PONG parse error: %s", exc)
 
             feedback_thread = threading.Thread(
                 target=feedback_listener, daemon=True, name="FeedbackListener"
@@ -678,13 +785,11 @@ class FileSender:
                                 except ValueError:
                                     pass
 
-                    # Drain RESEND packets from feedback queue (arrives on 9001)
-                    while True:
-                        try:
-                            batch = resend_feedback_queue.get_nowait()
-                            all_missing.extend(batch)
-                        except queue.Empty:
-                            break
+                    # Drain pending RESEND IDs accumulated by feedback_listener
+                    with resend_lock:
+                        if pending_resend_set:
+                            all_missing.extend(pending_resend_set)
+                            pending_resend_set.clear()
 
                 # ── Act on collected responses ─────────────────────────────────────
                 if got_complete:
@@ -796,12 +901,10 @@ class FileSender:
                     return False
 
                 if all_missing:
-                    seen: set = set()
-                    unique_missing: List[int] = []
-                    for cid in all_missing:
-                        if cid not in seen:
-                            seen.add(cid)
-                            unique_missing.append(cid)
+                    # Deduplicate across all RESEND batches collected this
+                    # window, then sort ascending so lowest chunk IDs (oldest
+                    # in the sequential initial pass) are retransmitted first.
+                    unique_missing: List[int] = sorted(set(all_missing))
 
                     # Record this pass (chunks_lost = missing going into next pass)
                     _prev_pass_idx = resend_pass  # 0 = initial, N = resend N

@@ -52,9 +52,10 @@ from protocol import (
     PacketType, build_packet, parse_packet,
     build_ack_payload, build_resend_payload, build_complete_payload,
     build_error_payload, build_nack_payload, build_throughput_report_payload,
-    build_rate_hint_payload, parse_rate_hint_payload,
+    build_rate_hint_payload, build_sack_payload, build_ping_payload,
+    parse_rate_hint_payload,
     parse_init_payload, parse_meta_payload, parse_data_payload,
-    parse_loss_report_payload,
+    parse_loss_report_payload, parse_ping_payload,
 )
 from transport import UDPTransport
 
@@ -344,6 +345,29 @@ class FileReceiver:
                         feedback_transport, feedback_dest, bytes_counter,
                     )
 
+                # ── Phase 4: SACK sender thread ───────────────────────────────
+                sack_stop   = threading.Event()
+                if self._cfg.sack_enabled:
+                    sack_thread = threading.Thread(
+                        target=self._sack_sender_thread,
+                        args=(
+                            written_chunks, chunks_lock,
+                            feedback_transport, feedback_dest,
+                            session_id, sack_stop,
+                            self._cfg.sack_interval_ms / 1_000.0,
+                        ),
+                        daemon=True, name="SACKSender",
+                    )
+                    sack_thread.start()
+                    logger.info(
+                        "SACKSender started  interval=%d ms → %s:%d",
+                        self._cfg.sack_interval_ms,
+                        feedback_dest[0], feedback_dest[1],
+                    )
+                else:
+                    sack_thread = None
+                    logger.info("SACKSender: disabled (sack_enabled=false)")
+
                 # ── Throughput reporter ────────────────────────────────────────
                 throughput_stop   = threading.Event()
                 throughput_thread = threading.Thread(
@@ -391,6 +415,7 @@ class FileReceiver:
                         last_recv_mbps=last_recv_mbps,
                     )
                 finally:
+                    sack_stop.set()
                     progress_stop.set()
                     throughput_stop.set()
                     stop_recv_event.set()
@@ -685,6 +710,74 @@ class FileReceiver:
             writer_id, chunks_written, chunks_failed,
         )
 
+    # ── SACK helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _chunks_to_ranges(chunk_ids: List[int]) -> List[Tuple[int, int]]:
+        """
+        Convert a sorted list of chunk IDs into run-length encoded ranges.
+
+        Example: [0,1,2,5,6,10] → [(0,3),(5,2),(10,1)]
+
+        chunk_ids MUST be sorted ascending before calling this function.
+        """
+        if not chunk_ids:
+            return []
+        ranges: List[Tuple[int, int]] = []
+        start = chunk_ids[0]
+        run   = 1
+        for cid in chunk_ids[1:]:
+            if cid == start + run:
+                run += 1
+            else:
+                ranges.append((start, run))
+                start = cid
+                run   = 1
+        ranges.append((start, run))
+        return ranges
+
+    def _sack_sender_thread(
+        self,
+        written_chunks: Set[int],
+        chunks_lock:    threading.Lock,
+        feedback_transport,
+        feedback_dest:  Tuple[str, int],
+        session_id:     bytes,
+        stop_event:     threading.Event,
+        interval_s:     float,
+    ) -> None:
+        """
+        Periodically sends SACK packets to the sender on the feedback channel.
+
+        Wakes every interval_s, snapshots written_chunks under the lock,
+        computes run-length encoded ranges, and sends a SACK packet.
+
+        This gives the sender a continuous view of which chunks have been
+        received and acknowledged, allowing it to release window slots and
+        derive the missing set without waiting for FINISH.
+        """
+        while not stop_event.wait(timeout=interval_s):
+            with chunks_lock:
+                sorted_ids = sorted(written_chunks)
+
+            if not sorted_ids:
+                continue
+
+            ranges = self._chunks_to_ranges(sorted_ids)
+            try:
+                pkt = build_packet(
+                    PacketType.SACK, session_id, 0,
+                    build_sack_payload(ranges),
+                )
+                feedback_transport.send(pkt, feedback_dest)
+                logger.debug(
+                    "SACK sent: %d range(s)  covering %d chunks → %s:%d",
+                    len(ranges), len(sorted_ids),
+                    feedback_dest[0], feedback_dest[1],
+                )
+            except OSError as exc:
+                logger.debug("SACK send error: %s", exc)
+
     # ── NACK helper ───────────────────────────────────────────────────────────
 
     def _send_nack(self, transport, dest, session_id, chunk_id):
@@ -951,6 +1044,8 @@ class FileReceiver:
 
     def _send_resend_batched(self, feedback_transport, feedback_dest,
                              session_id, missing: List[int]) -> int:
+        # Sort ascending so sender retransmits oldest (lowest) chunk IDs first.
+        missing = sorted(missing)
         n_ids  = len(missing)
         n_pkts = 0
         offset = 0
@@ -1034,6 +1129,20 @@ class FileReceiver:
             data, _ = result
             pkt = parse_packet(data)
             if pkt is None or pkt.session_id != session_id:
+                continue
+
+            if pkt.ptype == PacketType.PING:
+                # Echo the payload EXACTLY as PONG on the feedback channel.
+                # Sender computes RTT = now - sent_timestamp_ns on receipt.
+                try:
+                    feedback_transport.send(
+                        build_packet(PacketType.PONG, session_id, 0, pkt.payload),
+                        feedback_dest,
+                    )
+                    ts_ns = parse_ping_payload(pkt.payload)
+                    logger.debug("PING → PONG  ts_ns=%d", ts_ns)
+                except Exception as exc:
+                    logger.debug("PONG send error: %s", exc)
                 continue
 
             if pkt.ptype == PacketType.RATE_HINT:

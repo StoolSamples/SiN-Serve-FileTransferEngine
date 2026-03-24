@@ -35,6 +35,7 @@ from integrity import compute_chunk_hash
 from pacing import AdaptivePacingController
 from protocol import PacketType, build_data_payload, build_packet
 from transport import UDPTransport
+from window import WindowController
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,7 @@ class StreamManager:
         session_id: bytes,
         crypto: CryptoEngine,
         rate_limiter=None,
+        window: Optional[WindowController] = None,
     ) -> None:
         if not data_transports:
             raise ValueError("data_transports must contain at least one transport")
@@ -117,6 +119,7 @@ class StreamManager:
         self._session_id     = session_id
         self._crypto         = crypto
         self._rate_limiter   = rate_limiter
+        self._window         = window
 
         n = len(self._transports)
 
@@ -323,6 +326,29 @@ class StreamManager:
                         break
 
                     chunk_id = item
+
+                    # ── Window gate (Phase 4) ─────────────────────────────────
+                    # acquire() BEFORE reading or sending; release happens ONLY
+                    # in the sender's SACK handler — never here.
+                    if self._window is not None:
+                        _stall_log_t = time.monotonic()
+                        while not self._stop_event.is_set():
+                            if self._window.acquire(timeout=0.5):
+                                break
+                            # Log a stall warning every 5 s while blocked
+                            if time.monotonic() - _stall_log_t >= 5.0:
+                                logger.warning(
+                                    "stream %d: window STALL — in_flight=%d/%d  "
+                                    "waiting for SACK …",
+                                    stream_id,
+                                    self._window.in_flight,
+                                    self._window.max_window,
+                                )
+                                _stall_log_t = time.monotonic()
+                        else:
+                            # stop_event fired while waiting — abandon this chunk
+                            self._work_queue.task_done()
+                            break
 
                     try:
                         # ── Read chunk ────────────────────────────────────────
